@@ -40,7 +40,7 @@ Instructions:
 3. If the answer is "Yes" or "No," include a short explanation based on the clause.
 4. If the information is not found in the context, reply exactly with: "Not mentioned in the policy."
 5. Do NOT invent or assume any information outside the given context.
-6. Limit the answer to a maximum of one paragraph.
+6. Limit each answer to a maximum of one paragraph.
 7. If the context is too long, summarize it to focus on relevant parts.
 
 Answer:
@@ -134,9 +134,7 @@ def run_analysis(request: RunRequest, authorization: str = Header(...)):
             elif isinstance(request.documents, list):
                 doc_urls = request.documents
 
-        
         for doc_url in doc_urls:
-             # Parse URL to extract file name without query parameters
             parsed_url = urllib.parse.urlparse(doc_url)
             file_name = os.path.basename(parsed_url.path).lower()
             if file_name.endswith(".pdf"):
@@ -155,16 +153,30 @@ def run_analysis(request: RunRequest, authorization: str = Header(...)):
         if not combined_text.strip():
             raise HTTPException(status_code=400, detail="No valid content extracted from provided sources.")
 
-        context =combined_text # limit context for efficiency
+        context = combined_text.strip()
 
-        # Generate answers
-        answers = []
-        for question in request.questions:
-            prompt = PROMPT_TEMPLATE.format(context=context, query=question)
-            answer = call_mistral(prompt)
-            answers.append(answer.strip())
+        # Format multiple questions as a single multi-question prompt
+        numbered_questions = "\n".join([f"{i+1}. {q}" for i, q in enumerate(request.questions)])
+        multi_question_prompt = PROMPT_TEMPLATE.format(context=context, query=numbered_questions)
+        multi_answer_response = call_mistral(multi_question_prompt)
 
-        return {"answers": answers}
+        # Try splitting response by question number
+        split_answers = []
+        for i in range(len(request.questions)):
+            prefix = f"{i+1}."
+            next_prefix = f"{i+2}."
+            start = multi_answer_response.find(prefix)
+            end = multi_answer_response.find(next_prefix)
+            if start != -1:
+                answer = multi_answer_response[start:end].strip()
+                answer = answer.lstrip(f"{prefix}").strip()
+                split_answers.append(answer)
+        
+        # Fallback if not split properly
+        if not split_answers:
+            split_answers = [multi_answer_response.strip()]
+
+        return {"answers": split_answers}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
