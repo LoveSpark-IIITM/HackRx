@@ -17,7 +17,7 @@ MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 API_TOKEN = os.getenv("API_TOKEN")
 
 # Disk cache for storing document content
-cache = diskcache.Cache("/mnt/data/cache")
+cache = diskcache.Cache("./.cache")
 
 # ---------------------- Request Schema ----------------------
 class RunRequest(BaseModel):
