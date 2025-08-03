@@ -1,15 +1,13 @@
-from fastapi import FastAPI, Request, HTTPException, Header, UploadFile, File
+from fastapi import FastAPI, Request, HTTPException, Header
 from pydantic import BaseModel
-import os, requests, fitz, tempfile
+import os, fitz, io, urllib.parse, docx
 from dotenv import load_dotenv
-from typing import List, Optional
+from typing import List, Optional, Union
 from email import policy
 from email.parser import BytesParser
-import docx
-from langchain_community.vectorstores import FAISS
-from typing import List, Optional, Union
-from pydantic import BaseModel
-import urllib.parse
+import httpx
+import asyncio
+import diskcache
 
 load_dotenv()
 
@@ -18,13 +16,16 @@ app = FastAPI()
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 API_TOKEN = os.getenv("API_TOKEN")
 
-# Request schema
-class RunRequest(BaseModel):
-    documents: Optional[Union[str, List[str]]] = None  # URLs for docs
-    questions: List[str]
-    email_file: Optional[str] = None       # Optional email file URL
+# Disk cache for storing document content
+cache = diskcache.Cache("/mnt/data/cache")
 
-# Prompt Template
+# ---------------------- Request Schema ----------------------
+class RunRequest(BaseModel):
+    documents: Optional[Union[str, List[str]]] = None
+    questions: List[str]
+    email_file: Optional[str] = None
+
+# ---------------------- Prompt Template ----------------------
 PROMPT_TEMPLATE = """
 You are an insurance policy expert. Use ONLY the information provided in the context to answer the question.
 
@@ -46,9 +47,10 @@ Instructions:
 Answer:
 """
 
-# ---------------- Mistral API ----------------
-def call_mistral(prompt: str) -> str:
-    url = "https://api.mistral.ai/v1/chat/completions"
+# ---------------------- Async Mistral Call ----------------------
+async def call_mistral_async(context: str, question: str) -> str:
+    prompt = PROMPT_TEMPLATE.format(context=context, query=question)
+
     headers = {
         "Authorization": f"Bearer {MISTRAL_API_KEY}",
         "Content-Type": "application/json"
@@ -57,53 +59,37 @@ def call_mistral(prompt: str) -> str:
         "model": "mistral-small-latest",
         "temperature": 0.3,
         "top_p": 1,
-        "max_tokens": 500,
+        "max_tokens": 300,
         "messages": [{"role": "user", "content": prompt}]
     }
-    res = requests.post(url, headers=headers, json=payload)
-    res.raise_for_status()
-    return res.json()["choices"][0]["message"]["content"]
 
-# ---------------- Document Extractors ----------------
-def extract_text_from_pdf(pdf_url: str) -> str:
-    response = requests.get(pdf_url)
-    response.raise_for_status()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(response.content)
-        tmp_path = tmp.name
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        res = await client.post("https://api.mistral.ai/v1/chat/completions", headers=headers, json=payload)
+        res.raise_for_status()
+        return res.json()["choices"][0]["message"]["content"]
 
-    text = ""
-    doc = fitz.open(tmp_path)
-    for page in doc:
-        text += page.get_text("text")
-    doc.close()
-    os.remove(tmp_path)
-    return text.strip()
+# ---------------------- Async Document Downloader ----------------------
+async def download_bytes(url: str) -> bytes:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.content
 
-def extract_text_from_docx(docx_url: str) -> str:
-    response = requests.get(docx_url)
-    response.raise_for_status()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
-        tmp.write(response.content)
-        tmp_path = tmp.name
+# ---------------------- Extractors from Bytes ----------------------
+def extract_text_from_pdf_bytes(data: bytes) -> str:
+    with fitz.open(stream=data, filetype="pdf") as doc:
+        return "\n".join([page.get_text("text") for page in doc])
 
-    doc = docx.Document(tmp_path)
-    text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-    os.remove(tmp_path)
-    return text
+def extract_text_from_docx_bytes(data: bytes) -> str:
+    file_like = io.BytesIO(data)
+    document = docx.Document(file_like)
+    return "\n".join([p.text for p in document.paragraphs if p.text.strip()])
 
-def extract_text_from_email(email_url: str) -> str:
-    response = requests.get(email_url)
-    response.raise_for_status()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".eml") as tmp:
-        tmp.write(response.content)
-        tmp_path = tmp.name
+def extract_text_from_txt_bytes(data: bytes) -> str:
+    return data.decode("utf-8", errors="ignore")
 
-    with open(tmp_path, 'rb') as f:
-        msg = BytesParser(policy=policy.default).parse(f)
-    os.remove(tmp_path)
-
-    # Extract email text
+def extract_text_from_eml_bytes(data: bytes) -> str:
+    msg = BytesParser(policy=policy.default).parsebytes(data)
     email_text = f"Subject: {msg['subject']}\n\n"
     if msg.is_multipart():
         for part in msg.walk():
@@ -113,68 +99,65 @@ def extract_text_from_email(email_url: str) -> str:
         email_text += msg.get_content()
     return email_text.strip()
 
+# ---------------------- Health Check ----------------------
 @app.get("/")
 def read_root():
     return {"message": "FastAPI is running"}
 
-# ---------------- API Endpoint ----------------
+# ---------------------- Main Endpoint ----------------------
 @app.post("/api/v1/hackrx/run")
-def run_analysis(request: RunRequest, authorization: str = Header(...)):
+async def run_analysis(request: RunRequest, authorization: str = Header(...)):
     if authorization != f"Bearer {API_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
         combined_text = ""
+        doc_urls = [request.documents] if isinstance(request.documents, str) else (request.documents or [])
 
-        # Extract from documents
-        doc_urls = []
-        if request.documents:
-            if isinstance(request.documents, str):
-                doc_urls = [request.documents]
-            elif isinstance(request.documents, list):
-                doc_urls = request.documents
+        # Concurrently fetch documents
+        download_tasks = [download_bytes(url) for url in doc_urls]
+        file_datas = await asyncio.gather(*download_tasks)
 
-        for doc_url in doc_urls:
-            parsed_url = urllib.parse.urlparse(doc_url)
+        for url, data in zip(doc_urls, file_datas):
+            cached = cache.get(url)
+            if cached:
+                combined_text += "\n" + cached
+                continue
+
+            parsed_url = urllib.parse.urlparse(url)
             file_name = os.path.basename(parsed_url.path).lower()
-            if file_name.endswith(".pdf"):
-                combined_text += "\n" + extract_text_from_pdf(doc_url)
-            elif file_name.endswith(".docx"):
-                combined_text += "\n" + extract_text_from_docx(doc_url)
-            elif file_name.endswith(".txt"):
-                combined_text += "\n" + requests.get(doc_url).text
-            else:
-                raise HTTPException(status_code=400, detail=f"Unsupported document format: {doc_url}")
 
-        # Extract from email if provided
+            if file_name.endswith(".pdf"):
+                extracted = extract_text_from_pdf_bytes(data)
+            elif file_name.endswith(".docx"):
+                extracted = extract_text_from_docx_bytes(data)
+            elif file_name.endswith(".txt"):
+                extracted = extract_text_from_txt_bytes(data)
+            else:
+                raise HTTPException(status_code=400, detail=f"Unsupported document format: {url}")
+
+            combined_text += "\n" + extracted
+            cache.set(url, extracted)
+
+        # Optional email file
         if request.email_file:
-            combined_text += "\n" + extract_text_from_email(request.email_file)
+            email_cached = cache.get(request.email_file)
+            if email_cached:
+                combined_text += "\n" + email_cached
+            else:
+                email_bytes = await download_bytes(request.email_file)
+                email_text = extract_text_from_eml_bytes(email_bytes)
+                combined_text += "\n" + email_text
+                cache.set(request.email_file, email_text)
 
         if not combined_text.strip():
             raise HTTPException(status_code=400, detail="No valid content extracted from provided sources.")
 
         context = combined_text.strip()
 
-        # Format multiple questions as a single multi-question prompt
-        numbered_questions = "\n".join([f"{i+1}. {q}" for i, q in enumerate(request.questions)])
-        multi_question_prompt = PROMPT_TEMPLATE.format(context=context, query=numbered_questions)
-        multi_answer_response = call_mistral(multi_question_prompt)
-
-        # Try splitting response by question number
-        split_answers = []
-        for i in range(len(request.questions)):
-            prefix = f"{i+1}."
-            next_prefix = f"{i+2}."
-            start = multi_answer_response.find(prefix)
-            end = multi_answer_response.find(next_prefix)
-            if start != -1:
-                answer = multi_answer_response[start:end].strip()
-                answer = answer.lstrip(f"{prefix}").strip()
-                split_answers.append(answer)
-        
-        # Fallback if not split properly
-        if not split_answers:
-            split_answers = [multi_answer_response.strip()]
+        # Concurrent LLM calls
+        tasks = [call_mistral_async(context, q) for q in request.questions]
+        split_answers = await asyncio.gather(*tasks)
 
         return {"answers": split_answers}
 
