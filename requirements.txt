@@ -1,7 +1,11 @@
 fastapi
 uvicorn
+pydantic
 python-dotenv
 requests
 pymupdf
+python-docx
 langchain
 langchain-community
+faiss-cpu
+email-validator
