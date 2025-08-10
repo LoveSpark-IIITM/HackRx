@@ -1,7 +1,12 @@
 fastapi
-uvicorn
-python-docx
+uvicorn[standard]
+pydantic
 python-dotenv
+requests
+httpx[http2]
 PyMuPDF
-httpx
-diskcache
+pillow
+pytesseract
+groq
+urllib3
+beautifulsoup4
