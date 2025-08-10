@@ -248,6 +248,24 @@ def call_mistral(prompt: str) -> str:
     res.raise_for_status()
     return res.json()["choices"][0]["message"]["content"]
 
+def call_grok(prompt: str)->str:
+    url="https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+            "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+            "temperature": 0.3,
+            "top_p": 1,
+            "max_tokens": 1000,
+            "messages": [{"role": "user", "content": prompt}]
+        }
+    res = requests.post(url, headers=headers, json=payload, timeout=15)
+    res.raise_for_status()
+    return res.json()["choices"][0]["message"]["content"]
+
+
 def call_mistral_on_chunks(chunks: List[str], questions: List[str]) -> List[str]:
     question_block = "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions)])
     combined_context = "\n\n".join(chunks)
@@ -294,7 +312,7 @@ def solve_puzzle_with_llm(pdf_text: str, instruction_results: list, page_count: 
 
     # choose params
     try:
-        resp = call_mistral(prompt).strip()
+        resp = call_grok(prompt).strip()
         # Ensure we return only the first non-empty line (final answer)
         for line in resp.splitlines():
             if line.strip():
