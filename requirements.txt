@@ -10,3 +10,4 @@ pytesseract
 groq
 urllib3
 beautifulsoup4
+googletrans==4.0.0rc1
