@@ -7,10 +7,11 @@ import pytesseract
 import httpx
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
+from googletrans import Translator
 
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-
+from langdetect import detect
 
 REQUESTS_SESSION = requests.Session()
 REQUESTS_SESSION.headers.update({"Accept-Encoding": "gzip, deflate"})
@@ -23,6 +24,7 @@ REQUESTS_SESSION.mount(
 )
 
 load_dotenv()
+translator = Translator()
 
 #pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
@@ -49,7 +51,6 @@ Instructions:
 3. If the answer is "Yes" or "No," include a short explanation.
 4. If question is not related to the context, reply: "Not mentioned in the policy."
 5. Give each answer in a single paragraph without numbering.
-
 Answers:"""
 
 CHUNK_PROMPT_TEMPLATE = """You are an insurance policy expert. Use ONLY the chunked context and questions to answer.
@@ -96,7 +97,7 @@ Executed Instruction Results:
 
 Task:
 - Solve the puzzle and return ONLY the final answer (no explanation, no steps, no reasoning).
-- The output must be a single sentence.
+- The output must be a single concise answer (one line).
 
 FINAL ANSWER:"""
 
@@ -147,8 +148,21 @@ def find_and_execute_instructions(text: str):
             })
     return results
 
-
-
+def translate_answers_to_question_language(questions: list[str], answers: list[str]) -> list[str]:
+    final_answers = []
+    for q, a in zip(questions, answers):
+        try:
+            q_lang = detect(q)
+            a_lang = detect(a)
+            if q_lang != a_lang:
+                translated = translator.translate(a, dest=q_lang).text
+                final_answers.append(translated)
+            else:
+                final_answers.append(a)
+        except Exception:
+            # Fallback: keep original answer if translation fails
+            final_answers.append(a)
+    return final_answers
 
 # Extract text from PDF (OCR if needed)
 def extract_text_from_pdf_url(pdf_url: str) -> tuple[str, int, str]:
@@ -265,13 +279,13 @@ def call_grok(prompt: str)->str:
     res.raise_for_status()
     return res.json()["choices"][0]["message"]["content"]
 
-
 def call_mistral_on_chunks(chunks: List[str], questions: List[str]) -> List[str]:
     question_block = "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions)])
     combined_context = "\n\n".join(chunks)
     prompt = CHUNK_PROMPT_TEMPLATE.format(context=combined_context, query=question_block)
     answer = call_mistral(prompt)
     return [a.strip() for a in answer.split("\n") if a.strip()]
+
 
 # Groq fallback
 async def call_groq_on_chunks(chunks: List[str], questions: List[str]) -> List[str]:
@@ -312,8 +326,9 @@ def solve_puzzle_with_llm(pdf_text: str, instruction_results: list, page_count: 
 
     # choose params
     try:
-        resp = call_grok(prompt).strip()
+        resp = call_mistral(prompt).strip()
         # Ensure we return only the first non-empty line (final answer)
+        print(resp)
         for line in resp.splitlines():
             if line.strip():
                 return line.strip()
@@ -338,6 +353,7 @@ def read_root():
 # Main Endpoint
 @app.post("/api/v1/hackrx/run")
 async def run_analysis(request: RunRequest, authorization: str = Header(...)):
+    print("Request: ",request)
     if authorization != f"Bearer {API_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -385,6 +401,7 @@ async def run_analysis(request: RunRequest, authorization: str = Header(...)):
             except Exception:
                 try:
                     answers = await call_groq_on_chunks([full_text], request.questions)
+                    answers = [re.sub(r"^\d+[\.\)]\s*", "", a.strip()) for a in answers.split("\n") if a.strip()]
                     return {"answers": answers}
                 except Exception:
                     raise HTTPException(status_code=500, detail="Both LLMs failed for webpage content.")
@@ -397,6 +414,8 @@ async def run_analysis(request: RunRequest, authorization: str = Header(...)):
                 prompt = FULL_PROMPT_TEMPLATE.format(context=full_text, query=question_block)
                 response = call_mistral(prompt)
                 answers = [re.sub(r"^\d+[\.\)]\s*", "", a.strip()) for a in response.split("\n") if a.strip()]
+                answers = translate_answers_to_question_language(request.questions, answers)
+                #answers = match_answer_language(request.questions, answers)
                 return {"answers": answers}
             except Exception:
                 raise HTTPException(status_code=500, detail="Mistral failed on full content.")
